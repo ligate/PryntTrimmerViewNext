@@ -1,20 +1,20 @@
-//
 //  AssetVideoScrollView.swift
-//  PryntTrimmerView
+//  PryntTrimmerView – safer main-thread version
 //
-//  Created by HHK on 28/03/2017.
-//  Copyright © 2017 Prynt. All rights reserved.
-//
+//  Updated: @MainActor + strict main-queue UI, bounds guards, clean generator callbacks
 
 import AVFoundation
 import UIKit
 
-class AssetVideoScrollView: UIScrollView {
+@MainActor
+final class AssetVideoScrollView: UIScrollView {
 
-    private var widthConstraint: NSLayoutConstraint?
-
-    let contentView = UIView()
+    // MARK: - Public
     public var maxDuration: Double = 15
+
+    // MARK: - Private
+    private let contentView = UIView()
+    private var widthConstraint: NSLayoutConstraint?
     private var generator: AVAssetImageGenerator?
 
     override init(frame: CGRect) {
@@ -27,8 +27,12 @@ class AssetVideoScrollView: UIScrollView {
         setupSubviews()
     }
 
-    private func setupSubviews() {
+    deinit {
+        generator?.cancelAllCGImageGeneration()
+        generator = nil
+    }
 
+    private func setupSubviews() {
         backgroundColor = .clear
         showsVerticalScrollIndicator = false
         showsHorizontalScrollIndicator = false
@@ -39,9 +43,11 @@ class AssetVideoScrollView: UIScrollView {
         contentView.tag = -1
         addSubview(contentView)
 
-        contentView.leftAnchor.constraint(equalTo: leftAnchor).isActive = true
-        contentView.topAnchor.constraint(equalTo: topAnchor).isActive = true
-        contentView.bottomAnchor.constraint(equalTo: bottomAnchor).isActive = true
+        NSLayoutConstraint.activate([
+            contentView.leftAnchor.constraint(equalTo: leftAnchor),
+            contentView.topAnchor.constraint(equalTo: topAnchor),
+            contentView.bottomAnchor.constraint(equalTo: bottomAnchor)
+        ])
         widthConstraint = contentView.widthAnchor.constraint(equalTo: widthAnchor, multiplier: 1.0)
         widthConstraint?.isActive = true
     }
@@ -51,115 +57,164 @@ class AssetVideoScrollView: UIScrollView {
         contentSize = contentView.bounds.size
     }
 
-    internal func regenerateThumbnails(for asset: AVAsset) {
-        guard let thumbnailSize = getThumbnailFrameSize(from: asset), thumbnailSize.width != 0 else {
-            print("Could not calculate the thumbnail size.")
+    // MARK: - Thumbnails
+
+    func regenerateThumbnails(for asset: AVAsset) {
+        // UI is @MainActor; assert in debug
+        assert(Thread.isMainThread)
+
+        // If we don't have geometry yet, defer one tick.
+        guard bounds.width > 0, bounds.height > 0 else {
+            DispatchQueue.main.async { [weak self] in
+                self?.regenerateThumbnails(for: asset)
+            }
             return
         }
 
+        guard let thumbnailSize = getThumbnailFrameSize(from: asset),
+              thumbnailSize.width > 0, thumbnailSize.height > 0 else {
+            // Unable to compute a sensible tile size (e.g. no track yet)
+            return
+        }
+
+        // Cancel any prior work immediately
         generator?.cancelAllCGImageGeneration()
+
+        // Remove old tiles (UI change → main)
         removeFormerThumbnails()
+
+        // Update content width (based on duration vs maxDuration)
         let newContentSize = setContentSize(for: asset)
-        let visibleThumbnailsCount = Int(ceil(frame.width / thumbnailSize.width))
-        let thumbnailCount = Int(ceil(newContentSize.width / thumbnailSize.width))
+
+        // Compute counts using realized bounds
+        let visibleThumbnailsCount = max(1, Int(ceil(bounds.width / thumbnailSize.width)))
+        let thumbnailCount = max(1, Int(ceil(newContentSize.width / thumbnailSize.width)))
+
         addThumbnailViews(thumbnailCount, size: thumbnailSize)
-        let timesForThumbnail = getThumbnailTimes(for: asset, numberOfThumbnails: thumbnailCount)
-        generateImages(for: asset, at: timesForThumbnail, with: thumbnailSize, visibleThumbnails: visibleThumbnailsCount)
+
+        let timesForThumbnails = getThumbnailTimes(for: asset, numberOfThumbnails: thumbnailCount)
+
+        generateImages(for: asset,
+                       at: timesForThumbnails,
+                       with: thumbnailSize,
+                       visibleThumbnails: visibleThumbnailsCount)
     }
 
     private func getThumbnailFrameSize(from asset: AVAsset) -> CGSize? {
-        guard let track = asset.tracks(withMediaType: AVMediaType.video).first else { return nil}
+        guard let track = asset.tracks(withMediaType: .video).first else { return nil }
 
-        let assetSize = track.naturalSize.applying(track.preferredTransform)
+        // Use absolute natural size after transform (rotation may flip signs)
+        let transformed = track.naturalSize.applying(track.preferredTransform)
+        let videoW = abs(transformed.width)
+        let videoH = abs(transformed.height)
 
-        let height = frame.height
-        let ratio = assetSize.width / assetSize.height
-        let width = height * ratio
-        return CGSize(width: abs(width), height: abs(height))
+        let targetH = max(1, bounds.height) // ensure non-zero height
+        guard videoW > 0, videoH > 0 else { return nil }
+
+        let ratio = videoW / videoH
+        guard ratio.isFinite && ratio > 0 else { return nil }
+
+        let targetW = targetH * ratio
+        return CGSize(width: targetW, height: targetH)
     }
 
     private func removeFormerThumbnails() {
-        contentView.subviews.forEach({ $0.removeFromSuperview() })
+        contentView.subviews.forEach { $0.removeFromSuperview() }
     }
 
     private func setContentSize(for asset: AVAsset) -> CGSize {
+        let duration = max(asset.duration.seconds, 0.001)
+        let factor = CGFloat(max(1.0, duration / max(maxDuration, 0.001)))
 
-        let contentWidthFactor = CGFloat(max(1, asset.duration.seconds / maxDuration))
         widthConstraint?.isActive = false
-        widthConstraint = contentView.widthAnchor.constraint(equalTo: widthAnchor, multiplier: contentWidthFactor)
+        widthConstraint = contentView.widthAnchor.constraint(equalTo: widthAnchor, multiplier: factor)
         widthConstraint?.isActive = true
+
+        // Realize new bounds before computing counts
         layoutIfNeeded()
         return contentView.bounds.size
     }
 
     private func addThumbnailViews(_ count: Int, size: CGSize) {
-
+        guard count > 0 else { return }
         for index in 0..<count {
+            let imageView = UIImageView(frame: .zero)
+            imageView.clipsToBounds = true
+            imageView.contentMode = .scaleAspectFill // fill to avoid gaps
+            imageView.tag = index
 
-            let thumbnailView = UIImageView(frame: CGRect.zero)
-            thumbnailView.clipsToBounds = true
+            // Position
+            let originX = CGFloat(index) * size.width
+            let maxWidth = contentView.bounds.width
 
-            let viewEndX = CGFloat(index) * size.width + size.width
+            // Clamp last tile to not exceed content width
+            let remaining = maxWidth - originX
+            let tileWidth = max(0, min(size.width, remaining))
 
-            if viewEndX > contentView.frame.width {
-                thumbnailView.frame.size = CGSize(width: size.width + (contentView.frame.width - viewEndX), height: size.height)
-                thumbnailView.contentMode = .scaleAspectFill
-            } else {
-                thumbnailView.frame.size = size
-                thumbnailView.contentMode = .scaleAspectFit
-            }
-
-            thumbnailView.frame.origin = CGPoint(x: CGFloat(index) * size.width, y: 0)
-            thumbnailView.tag = index
-            contentView.addSubview(thumbnailView)
+            imageView.frame = CGRect(x: originX, y: 0, width: tileWidth, height: size.height)
+            contentView.addSubview(imageView)
         }
     }
 
     private func getThumbnailTimes(for asset: AVAsset, numberOfThumbnails: Int) -> [NSValue] {
-        let timeIncrement = (asset.duration.seconds * 1000) / Double(numberOfThumbnails)
-        var timesForThumbnails = [NSValue]()
-        for index in 0..<numberOfThumbnails {
-            let cmTime = CMTime(value: Int64(timeIncrement * Float64(index)), timescale: 1000)
-            let nsValue = NSValue(time: cmTime)
-            timesForThumbnails.append(nsValue)
+        let duration = asset.duration
+        let durationMs = max(duration.seconds, 0.001) * 1000.0
+        let step = durationMs / Double(max(1, numberOfThumbnails))
+
+        var times = [NSValue]()
+        times.reserveCapacity(max(1, numberOfThumbnails))
+
+        // Sample in the center of each tile interval; keep strictly before end
+        for i in 0..<max(1, numberOfThumbnails) {
+            let ms = min(durationMs - 1.0, (Double(i) + 0.5) * step)
+            let cmTime = CMTime(value: Int64(ms), timescale: 1000)
+            times.append(NSValue(time: cmTime))
         }
-        return timesForThumbnails
+        return times
     }
 
-    private func generateImages(for asset: AVAsset, at times: [NSValue], with maximumSize: CGSize, visibleThumbnails: Int) {
-        generator = AVAssetImageGenerator(asset: asset)
-        generator?.appliesPreferredTrackTransform = true
+    private func generateImages(for asset: AVAsset,
+                                at times: [NSValue],
+                                with maximumSize: CGSize,
+                                visibleThumbnails: Int) {
+        let gen = AVAssetImageGenerator(asset: asset)
+        gen.appliesPreferredTrackTransform = true
 
-        let scaledSize = CGSize(width: maximumSize.width * UIScreen.main.scale, height: maximumSize.height * UIScreen.main.scale)
-        generator?.maximumSize = scaledSize
-        var count = 0
+        // Exact frame requests for crisp strips
+        gen.requestedTimeToleranceBefore = .zero
+        gen.requestedTimeToleranceAfter  = .zero
 
-        let handler: AVAssetImageGeneratorCompletionHandler = { [weak self] (_, cgimage, _, result, error) in
-            if let cgimage = cgimage, error == nil && result == AVAssetImageGenerator.Result.succeeded {
-                DispatchQueue.main.async(execute: { [weak self] () -> Void in
+        // Retina-aware max size
+        let scale = UIScreen.main.scale
+        gen.maximumSize = CGSize(width: maximumSize.width * scale,
+                                 height: maximumSize.height * scale)
 
-                    if count == 0 {
-                        self?.displayFirstImage(cgimage, visibleThumbnails: visibleThumbnails)
-                    }
-                    self?.displayImage(cgimage, at: count)
-                    count += 1
-                })
+        // Swap in new generator after configuration (helps avoid races)
+        generator = gen
+
+        var index = 0
+        gen.generateCGImagesAsynchronously(forTimes: times) { [weak self] _, cgImage, _, result, _ in
+            guard let self = self, result == .succeeded, let cgImage = cgImage else { return }
+            // UI update strictly on main
+            DispatchQueue.main.async {
+                if index == 0 {
+                    self.displayFirstImage(cgImage, visibleThumbnails: visibleThumbnails)
+                }
+                self.displayImage(cgImage, at: index)
+                index += 1
             }
         }
-
-        generator?.generateCGImagesAsynchronously(forTimes: times, completionHandler: handler)
     }
 
     private func displayFirstImage(_ cgImage: CGImage, visibleThumbnails: Int) {
-        for i in 0...visibleThumbnails {
+        guard visibleThumbnails > 0 else { return }
+        for i in 0..<visibleThumbnails {
             displayImage(cgImage, at: i)
         }
     }
 
     private func displayImage(_ cgImage: CGImage, at index: Int) {
-        if let imageView = contentView.viewWithTag(index) as? UIImageView {
-            let uiimage = UIImage(cgImage: cgImage, scale: 1.0, orientation: UIImage.Orientation.up)
-            imageView.image = uiimage
-        }
+        guard let imageView = contentView.viewWithTag(index) as? UIImageView else { return }
+        imageView.image = UIImage(cgImage: cgImage, scale: 1.0, orientation: .up)
     }
 }
